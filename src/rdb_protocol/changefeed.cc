@@ -49,6 +49,15 @@ struct stamped_range_t {
     // `stamped_range_t` before populating `ranges`.)
     // MOVABLE_BUT_NOT_COPYABLE(stamped_range_t);
 };
+void debug_print(printf_buffer_t *buf, const stamped_range_t &rng) {
+    buf->appendf("stamped_range_t{");
+    debug_print(buf, rng.next_expected_stamp);
+    buf->appendf(", ");
+    debug_print(buf, rng.left_fencepost);
+    buf->appendf(", ");
+    debug_print(buf, rng.ranges);
+    buf->appendf("}");
+}
 
 struct change_val_t {
     change_val_t(std::pair<uuid_u, uint64_t> _source_stamp,
@@ -143,6 +152,11 @@ std::string print(const change_val_t &cv) {
 }
 } // namespace debug
 
+template<class T>
+void debug_print(printf_buffer_t *buf, const T &t) {
+    buf->appendf("%s", debug::print(t).c_str());
+}
+
 datum_t vals_to_change(
     datum_t old_val,
     datum_t new_val,
@@ -183,11 +197,13 @@ public:
     virtual void clear() = 0;
     virtual change_val_t pop() = 0;
     virtual const change_val_t &peek() = 0;
+    virtual void purge_below(std::map<uuid_u, uint64_t> stamps) = 0;
 };
 
-class squashing_queue_t : public maybe_squashing_queue_t {
+class squashing_queue_t final : public maybe_squashing_queue_t {
 public:
-    virtual void add(change_val_t change_val) {
+    squashing_queue_t() : initial(std::vector<change_val_t>()) { }
+    void add(change_val_t change_val) final {
         auto it = queue.find(change_val.pkey);
         if (it == queue.end()) {
             auto order_it = queue_order.insert(queue_order.end(), change_val.pkey);
@@ -213,21 +229,21 @@ public:
             }
         }
     }
-    virtual size_t size() const {
+    size_t size() const final {
         guarantee(queue.size() == queue_order.size());
         return queue.size();
     }
-    virtual void clear() {
+    void clear() final {
         queue.clear();
         queue_order.clear();
     }
-    virtual const change_val_t &peek() {
+    const change_val_t &peek() final {
         guarantee(size() != 0);
         auto it = queue.find(*queue_order.begin());
         guarantee(it != queue.end());
         return it->second.first;
     }
-    virtual change_val_t pop() {
+    change_val_t pop() final {
         guarantee(size() != 0);
         auto it = queue.find(*queue_order.begin());
         guarantee(it != queue.end());
@@ -236,7 +252,25 @@ public:
         queue_order.pop_front();
         return ret;
     }
+    void purge_below(std::map<uuid_u, uint64_t> stamps) {
+        guarantee(initial);
+        std::vector<change_val_t> cvs = std::move(*initial);
+        initial = boost::none;
+        guarantee(!initial);
+        guarantee(queue.empty());
+        guarantee(queue_order.empty());
+        for (auto &&cv : cvs) {
+            auto it = stamps.find(cv.source_stamp.first);
+            r_sanity_check(it != stamps.end());
+            // We want `>=` here because the semantics are that the start stamp
+            // is the first stamp we expect.
+            if (cv.source_stamp.second >= it->second) {
+                add(std::move(cv));
+            }
+        }
+    }
 private:
+    boost::optional<std::vector<change_val_t> > initial;
     std::map<store_key_t,
              std::pair<change_val_t, std::list<store_key_t>::iterator> > queue;
     std::list<store_key_t> queue_order;
@@ -261,6 +295,20 @@ class nonsquashing_queue_t : public maybe_squashing_queue_t {
         auto ret = std::move(queue.front());
         queue.pop_front();
         return ret;
+    }
+    virtual void purge_below(std::map<uuid_u, uint64_t> stamps) {
+        std::deque<change_val_t> old_queue;
+        old_queue.swap(queue);
+        guarantee(queue.empty());
+        for (auto &&cv : old_queue) {
+            auto it = stamps.find(cv.source_stamp.first);
+            r_sanity_check(it != stamps.end());
+            // We want `>=` here because the semantics are that the start stamp
+            // is the first stamp we expect.
+            if (cv.source_stamp.second >= it->second) {
+                add(std::move(cv));
+            }
+        }
     }
     std::deque<change_val_t> queue;
 };
@@ -1317,7 +1365,6 @@ private:
     virtual bool has_el() = 0;
     virtual datum_t pop_el() = 0;
     virtual void apply_queued_changes() = 0;
-    virtual bool active() = 0;
 
     // Used to block on more changes.  NULL unless we're waiting.
     cond_t *cond;
@@ -1338,6 +1385,7 @@ public:
         const boost::optional<std::string> &DEBUG_ONLY(sindex),
         boost::optional<indexed_datum_t> old_val,
         boost::optional<indexed_datum_t> new_val) {
+        if (!active()) return;
         if (update_stamp(shard_uuid, stamp)) {
             queue->add(change_val_t(
                 std::make_pair(shard_uuid, stamp),
@@ -1364,6 +1412,7 @@ public:
     bool has_change_val() { return queue->size() != 0; }
     change_val_t pop_change_val() { return queue->pop(); }
     const change_val_t &peek_change_val() { return queue->peek(); }
+    bool active() { return !exc; }
 protected:
     // The queue of changes we've accumulated since the last time we were read from.
     const scoped_ptr_t<maybe_squashing_queue_t> queue;
@@ -1749,8 +1798,6 @@ public:
         return make_counted<stream_t<subscription_t> >(std::move(self), bt);
     }
 private:
-    bool active() final { return started; }
-
     datum_t pkey;
     boost::optional<change_val_t> initial_val;
     uint64_t stamp;
@@ -1814,12 +1861,6 @@ public:
         }
     }
 
-    virtual bool active() {
-        // If we don't have start timestamps, we haven't started, and if we have
-        // exc, we've stopped.
-        return start_stamps.size() != 0 && !exc;
-    }
-
     bool has_ops() { return ops.size() != 0; }
 
     boost::optional<datum_t> apply_ops(datum_t val) {
@@ -1841,12 +1882,11 @@ public:
     bool update_stamp(const uuid_u &uuid, uint64_t new_stamp) final {
         guarantee(active());
         auto it = start_stamps.find(uuid);
-        guarantee(it != start_stamps.end());
-        // Note that we currently *DO NOT* update the stamp for range
-        // subscriptions.  If we get changes with stamps after the start stamp
-        // we eventually receive, they are just discarded.  This will change in
-        // the future when we support `include_initial` on range changefeeds.
-        return new_stamp >= it->second;
+        if (it == start_stamps.end() || new_stamp >= it->second) {
+            start_stamps[uuid] = new_stamp;
+            return true;
+        }
+        return false;
     }
 
     datum_t pop_el() final {
@@ -1892,7 +1932,16 @@ public:
         guarantee(resp != nullptr);
         rcheck_datum(resp->stamps, base_exc_t::RESUMABLE_OP_FAILED,
                      "Unable to retrieve the start stamps.  Did you just reshard?");
-        start_stamps = std::move(*resp->stamps);
+        std::map<uuid_u, uint64_t> purge_stamps;
+        for (const auto &pair : *resp->stamps) {
+            auto res = start_stamps.insert(pair);
+            // If we already have stamps.
+            if (!res.second) {
+                purge_stamps.insert(pair);
+            }
+        }
+        queue->purge_below(purge_stamps);
+        debugf("start_stamps: %s\n", debug_str(start_stamps).c_str());
         rcheck_datum(start_stamps.size() != 0, base_exc_t::RESUMABLE_OP_FAILED,
                      "Empty start stamps.  Did you just reshard?");
 
@@ -2208,7 +2257,6 @@ public:
     }
 
     virtual bool has_el() { return els.size() != 0; }
-    virtual bool active() { return need_init == got_init; }
     virtual datum_t pop_el() {
         guarantee(has_el());
         datum_t ret = std::move(els.front());
@@ -2506,10 +2554,12 @@ private:
         batcher_t batcher = bs.to_batcher();
 
         while (ret.size() == 0) {
+            debugf("LOOP\n");
             r_sanity_check(!batcher.should_send_batch());
             // If there's nothing left to read, behave like a normal feed.  `ready`
             // should only be called after we've confirmed `is_exhausted` returns
             // true.
+            debugf("is_exhausted: %d\n", src->is_exhausted());
             if (src->is_exhausted() && ready()) {
                 // This will send the `ready` state as its first doc.
                 return stream_t::next_stream_batch(env, bs);
@@ -2523,12 +2573,15 @@ private:
             if (read_once) {
                 while (sub->has_change_val() && !batcher.should_send_batch()) {
                     change_val_t cv = sub->pop_change_val();
+                    debugf("cv: %s\n", debug_str(cv).c_str());
                     datum_t el = change_val_to_change(
                         cv,
                         cv.old_val && discard(
-                            cv.pkey, cv.old_val->tag_num, cv.source_stamp, *cv.old_val),
+                            cv.pkey,
+                            cv.old_val->tag_num, cv.source_stamp, *cv.old_val),
                         cv.new_val && discard(
-                            cv.pkey, cv.new_val->tag_num, cv.source_stamp, *cv.new_val));
+                            cv.pkey,
+                            cv.new_val->tag_num, cv.source_stamp, *cv.new_val));
                     if (el.has()) {
                         batcher.note_el(el);
                         ret.push_back(std::move(el));
@@ -2558,7 +2611,8 @@ private:
                 } else {
                     ret.reserve(ret.size() + batch.size());
                     for (auto &&datum : batch) {
-                        ret.push_back(vals_to_change(datum_t(), std::move(datum), true));
+                        ret.push_back(
+                            vals_to_change(datum_t(), std::move(datum), true));
                     }
                 }
             } else {
@@ -2570,7 +2624,9 @@ private:
                     // available.  This shouldn't matter too much because this
                     // case should be rare in practice, and napping more than
                     // once should be extremely rare.
-                    nap(50);
+
+                    // RSI: go back to 50
+                    nap(500);
                 }
             }
         }
@@ -2622,13 +2678,16 @@ private:
         }
     }
     void update_ranges() {
+        debugf("!!! update_ranges\n");
         active_state = src->truncate_and_get_active_state();
         key_range_t range = last_read_range();
         for (const auto &pair : last_read_stamps()) {
             add_range(pair.first, pair.second, range);
         }
+        debugf("%s\n", debug_str(stamped_ranges).c_str());
     }
     void remove_outdated_ranges() {
+        debugf("!!! remove_outdated_ranges\n");
         for (auto &&pair : stamped_ranges) {
             auto *ranges = &pair.second.ranges;
             while (ranges->size() > 0) {
@@ -2641,6 +2700,7 @@ private:
                 }
             }
         }
+        debugf("%s\n", debug_str(stamped_ranges).c_str());
     }
 
     const key_range_t &last_read_range() const {
@@ -2662,10 +2722,15 @@ private:
         if (!cached_ready) {
             remove_outdated_ranges();
             for (const auto &pair : stamped_ranges) {
-                if (pair.second.ranges.size() != 0) return cached_ready;
+                if (pair.second.ranges.size() != 0) {
+                    debugf("EARLY ready: %d\n", cached_ready);
+                    debugf("%s\n", debug_str(stamped_ranges).c_str());
+                    return cached_ready;
+                }
             }
             cached_ready = true;
         }
+        debugf("ready: %d\n", cached_ready);
         return cached_ready;
     }
 
